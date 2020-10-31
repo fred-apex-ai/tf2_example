@@ -23,6 +23,8 @@
 #include "rclcpp/rclcpp.hpp"
 
 using std::placeholders::_1;
+using namespace std::chrono_literals;
+
 
 class Waiter : public rclcpp::Node
 {
@@ -32,42 +34,65 @@ public:
     tf2_ros::CreateTimerInterface::SharedPtr cti = std::make_shared<tf2_ros::CreateTimerROS>(
       this->get_node_base_interface(), this->get_node_timers_interface());
     tf_buffer_.setCreateTimerInterface(cti);
-    timeout_ms_ = this->declare_parameter("timeout_ms").get<int>();
+    timeout_ms_ = std::chrono::milliseconds{this->declare_parameter("timeout_ms").get<int>()};
     RCLCPP_INFO(get_logger(), "timeout is %dms", timeout_ms_);
-    
-    waitUntilTFAvailable();
+
+    // blockUntilVehiclePositionAvailable();
+    blockUntilVehiclePositionAvailable2();
   }
 
 private:
-  void waitUntilTFAvailable()
+
+  void blockUntilVehiclePositionAvailable()
   {
-    double timeout_sec = timeout_ms_ * 0.001;
-    while (rclcpp::ok()) {
-      static constexpr auto from = "a", to = "b";
-      auto tf_future = tf_buffer_.waitForTransform(
-        from, to, tf2::TimePointZero, tf2::durationFromSec(0.0), [](auto &) {});
-      const auto status = tf_future.wait_for(tf2::durationFromSec(timeout_sec));
-      if (status == std::future_status::ready) {
-        RCLCPP_INFO(get_logger(), "tf gets ready. try tf_future.get()...");
-        try{
-          auto transform = tf_future.get();
-          RCLCPP_INFO(get_logger(), "Successed to get transform. End processing.");
-          break;
-        } catch (const tf2::LookupException & ex)
-        {
-          RCLCPP_WARN(get_logger(), "catch LookupException. what:[%s]. try again.", ex.what());
+    while (!transform_available_ && rclcpp::ok()) {
+      static constexpr auto input = "a", output = "b";
+      RCLCPP_INFO(
+                  get_logger(), "waiting %d ms for %s->%s transform to become available",
+                  timeout_ms_.count(), input, output);
+      auto callback = [this](const std::shared_future<geometry_msgs::msg::TransformStamped> & future) {
+        RCLCPP_INFO(get_logger(), "inside callback ");
+        try {
+          auto tf = future.get();
+          transform_available_ = true;
+          RCLCPP_INFO(get_logger(), "transform now available");
+          throw 5;
+        } catch (const tf2::TimeoutException & e) {
+          RCLCPP_INFO(get_logger(), "hit TimeoutException: %s", e.what());
         }
-      } else {
-        RCLCPP_INFO(
-          get_logger(), "tf is not ready. waiting another %f seconds for %s->%s transform",
-          timeout_sec, from, to);
-      }
+      };
+      auto future = tf_buffer_.waitForTransform(
+                                  input, output, tf2::TimePointZero, std::chrono::milliseconds(timeout_ms_), callback);
+      future.wait_for(timeout_ms_);
+      RCLCPP_INFO(get_logger(), "transform available after timeout? %d", transform_available_);
     }
+}
+
+  void blockUntilVehiclePositionAvailable2()
+  {
+    static constexpr auto input = "a", output = "b";
+    // tf_buffer_.setUsingDedicatedThread(true);
+    std::string msg;
+    // first call fails even if transform has been published. Why?
+    tf_buffer_.canTransform(input, output, tf2::TimePointZero, 0ms, &msg);
+      std::this_thread::sleep_for(3ms);
+
+    // If I don't use 0 ms timeout, warning about frame not existing appear
+    while(!tf_buffer_.canTransform(input, output, tf2::TimePointZero, 0ms, &msg) && rclcpp::ok()) {
+      RCLCPP_INFO(
+                  get_logger(), "waiting %d ms for %s->%s transform to become available",
+                  timeout_ms_.count(), input, output);
+      std::this_thread::sleep_for(timeout_ms_);
+    }
+    RCLCPP_INFO(get_logger(), "transform available");
+    auto tf = tf_buffer_.lookupTransform(input, output, tf2::TimePointZero);
+
   }
 
   tf2_ros::Buffer tf_buffer_;
   tf2_ros::TransformListener tf_listener_;
-  int timeout_ms_;
+  std::chrono::milliseconds timeout_ms_;
+  bool transform_available_ = false;
 };
 
 int main(int argc, char * argv[])
